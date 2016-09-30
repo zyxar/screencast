@@ -3,8 +3,9 @@
 #include <dxgi1_2.h>
 #include <windows.h>
 #include <algorithm>
-#include <string>
 #include <gdiplus.h>
+#include <boost/uuid/random_generator.hpp>
+#include <boost/uuid/uuid_io.hpp>
 #include "ScreenCapture.h"
 
 #pragma comment(lib, "gdiplus.lib")
@@ -44,14 +45,29 @@ static int GetEncoderClsid(const WCHAR* format, CLSID* pClsid)
 	return -1;
 }
 
-static bool SaveBitmapOnDisk(Gdiplus::Bitmap *srcImage, const wchar_t* fmt, const wchar_t* filename)
+static std::wstring GetTempDir()
 {
+	TCHAR path[MAX_PATH];
+	auto len = GetTempPathW(MAX_PATH, path);
+	return std::wstring(path, len);
+}
+
+static const std::wstring uuid()
+{
+	static boost::uuids::random_generator uuidGen;
+	return boost::uuids::to_wstring(uuidGen());
+}
+
+static bool SaveBitmapOnDisk(Gdiplus::Bitmap *srcImage, const wchar_t* fmt = L"image/jpeg")
+{
+	static std::wstring destDir = GetTempDir();
 	CLSID clsid;
 	if (GetEncoderClsid(fmt, &clsid) == -1)
 	{
 		delete srcImage;
 		return false;
 	}
+	auto destfile = destDir + uuid();
 	Gdiplus::EncoderParameters encoderParameters;
 	encoderParameters.Count = 1;
 	encoderParameters.Parameter[0].Guid = Gdiplus::EncoderQuality;
@@ -68,12 +84,13 @@ static bool SaveBitmapOnDisk(Gdiplus::Bitmap *srcImage, const wchar_t* fmt, cons
 		Gdiplus::Graphics graphic(&image);
 		graphic.ScaleTransform(rate, rate);
 		graphic.DrawImage(srcImage, 0, 0, srcWidth, srcHeight);
-		image.Save(filename, &clsid, &encoderParameters);
+		image.Save(destfile.c_str(), &clsid, &encoderParameters);
 	}
 	else
 	{
-		srcImage->Save(filename, &clsid, &encoderParameters);
+		srcImage->Save(destfile.c_str(), &clsid, &encoderParameters);
 	}
+	screencast::ScreenCapturer::FileList.push_back(destfile);
 	delete srcImage;
 	return true;
 }
@@ -163,7 +180,7 @@ public:
 	bool Init();
 
 protected:
-	friend std::_Ref_count_obj<scarscow::DxgiScreenCapturer>;
+	friend std::_Ref_count_obj<screencast::DxgiScreenCapturer>;
 	explicit DxgiScreenCapturer();
 	bool capture();
 	static const D3D_DRIVER_TYPE DriverTypes[];
@@ -185,10 +202,10 @@ private:
 
 const D3D_DRIVER_TYPE DxgiScreenCapturer::DriverTypes[] = { D3D_DRIVER_TYPE_HARDWARE };
 const D3D_FEATURE_LEVEL DxgiScreenCapturer::FeatureLevels[] = {
-																D3D_FEATURE_LEVEL_11_0,
-																D3D_FEATURE_LEVEL_10_1,
-																D3D_FEATURE_LEVEL_10_0,
-																D3D_FEATURE_LEVEL_9_1 };
+	D3D_FEATURE_LEVEL_11_0,
+	D3D_FEATURE_LEVEL_10_1,
+	D3D_FEATURE_LEVEL_10_0,
+	D3D_FEATURE_LEVEL_9_1 };
 const UINT DxgiScreenCapturer::NumDriverTypes = ARRAYSIZE(DxgiScreenCapturer::DriverTypes);
 const UINT DxgiScreenCapturer::NumFeatureLevels = ARRAYSIZE(DxgiScreenCapturer::FeatureLevels);
 
@@ -288,8 +305,7 @@ bool DxgiScreenCapturer::capture()
 		dptr -= bmpRowPitch;
 	}
 	context_->Unmap(destImage_, 0);
-	Gdiplus::Bitmap* image = new Gdiplus::Bitmap(&bmpInfo, pBuf.get());
-	return SaveBitmapOnDisk(image, L"image/jpeg", L"ScreenCapture.d3d.jpg");
+	return SaveBitmapOnDisk(new Gdiplus::Bitmap(&bmpInfo, pBuf.get()));
 }
 
 bool DxgiScreenCapturer::Init()
@@ -398,7 +414,7 @@ public:
 	bool Capture() override;
 protected:
 	explicit GdiScreenCapturer();
-	friend std::_Ref_count_obj<scarscow::GdiScreenCapturer>;
+	friend std::_Ref_count_obj<screencast::GdiScreenCapturer>;
 private:
 	HDC screen_;
 };
@@ -421,12 +437,10 @@ bool GdiScreenCapturer::Capture()
 		HDC dc = CreateCompatibleDC(hdcMonitor);
 		HBITMAP bmp = CreateCompatibleBitmap(hdcMonitor, width, height);
 		HGDIOBJ oldObj = SelectObject(dc, bmp);
-		bool b = StretchBlt(dc, 0, 0, width, height, hdcMonitor, lprcMonitor->left, lprcMonitor->top, width, height, SRCCOPY) != 0;
-		if (b)
+		if (0 != StretchBlt(dc, 0, 0, width, height, hdcMonitor,
+			lprcMonitor->left, lprcMonitor->top, width, height, SRCCOPY))
 		{
-			auto image = Gdiplus::Bitmap::FromHBITMAP(bmp, nullptr);
-			auto filename = std::wstring(L"ScreenCapture_") + std::to_wstring((int)hMonitor) + L".gdi.jpg";
-			SaveBitmapOnDisk(image, L"image/jpeg", filename.c_str());
+			SaveBitmapOnDisk(Gdiplus::Bitmap::FromHBITMAP(bmp, nullptr));
 		}
 		SelectObject(dc, oldObj);
 		DeleteDC(dc);
@@ -442,6 +456,7 @@ GdiScreenCapturer::~GdiScreenCapturer()
 }
 
 // static
+std::deque<std::wstring> ScreenCapturer::FileList;
 std::shared_ptr<ScreenCapturer> ScreenCapturer::Instance()
 {
 	static auto dxgiCap = SingletonOf<DxgiScreenCapturer>();
@@ -454,7 +469,7 @@ std::shared_ptr<ScreenCapturer> ScreenCapturer::Instance()
 		auto user32lib = std::unique_ptr<DynamicLib>(DynamicLib::Load(_T("user32.dll")));
 		if (user32lib)
 		{
-			BOOL(WINAPI *setProcessDPIAwareFunc)(void) = nullptr;
+			BOOL (WINAPI *setProcessDPIAwareFunc)(void) = nullptr;
 			setProcessDPIAwareFunc = user32lib->GetProcAddress("SetProcessDPIAware");
 			if (setProcessDPIAwareFunc != 0)
 			{
